@@ -4,47 +4,33 @@ extern crate openssl;
 extern crate serde_json;
 
 use std::net::TcpStream;
-use std::sync::Arc;
 
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use curl::http;
 use nom::AsBytes;
 use rustls::Session;
-use rustls_connector::{rustls, RustlsConnector, webpki};
+use rustls_connector::{rustls, RustlsConnector};
 use serde_json::Value;
 use url::Url;
-
-pub struct NoCertificateVerification;
-
-impl rustls::ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _roots: &rustls::RootCertStore,
-        _presented_certs: &[rustls::Certificate],
-        _dns_name: webpki::DNSNameRef<'_>,
-        _ocsp: &[u8],
-    ) -> Result<rustls::ServerCertVerified, rustls::TLSError> {
-        Ok(rustls::ServerCertVerified::assertion())
-    }
-}
 
 #[derive(Clone)]
 struct CertLoader<'a> {
     domain: &'a str,
 }
 
-
-fn load_remote_certificate(domain: CertLoader) -> String {
+/// calls the domain's 443 port and makes a sha256 hash of each certificate
+/// found in the chain.
+fn load_certificate_hashes_via_local(domain: CertLoader) -> Vec<String> {
     // parse url. try really hard
     let url_parsed = Url::parse(&format!("https://{}", domain.domain));
     let url = Url::parse(&*domain.domain)
         .or_else(|err| url_parsed.map_err(|_| err))
         .unwrap();
 
-    // disable verification since we want to perform the validation manually
     let mut config = rustls::ClientConfig::new();
-    config.dangerous().set_certificate_verifier(Arc::new(NoCertificateVerification));
+    config.root_store = rustls_native_certs::load_native_certs()
+        .expect("could not load platform certs");
     let connector: RustlsConnector = config.into();
 
     // connect
@@ -59,14 +45,20 @@ fn load_remote_certificate(domain: CertLoader) -> String {
         .get_peer_certificates()
         .unwrap();
 
-    let bytes = chain.first().unwrap().as_ref().as_bytes();
+    let mut vec = Vec::new();
     let mut sha256 = Sha256::new();
-    sha256.input(bytes);
-    // println!("{:?}", sha256.result_str());
-    return sha256.result_str();
+    // make a hash for each cert in the chain
+    for c in chain {
+        sha256.input(c.as_ref().as_bytes());
+        vec.push(sha256.result_str());
+        sha256.reset()
+    }
+    return vec;
 }
 
-fn get_from_api(domain: CertLoader) -> String {
+/// Gets certificate hashes for each certificate found in the chain.
+/// As seen from the public internet
+fn load_certificate_hashes_via_api(domain: CertLoader) -> Vec<String> {
     let domain_to_validate = domain.domain;
     let resp = http::handle()
         .get(&*format!("https://api.cert.ist/{}", domain_to_validate))
@@ -76,8 +68,9 @@ fn get_from_api(domain: CertLoader) -> String {
         });
 
     if resp.get_code() != 200 {
-        println!("Unable to handle HTTP response code {}", resp.get_code());
-        return "".to_string();
+        println!("Unable to handle HTTP response code {:?}",
+                 std::char::from_u32(resp.get_code()));
+        return Vec::new();
     }
 
     let body = std::str::from_utf8(resp.get_body()).unwrap_or_else(|e| {
@@ -88,30 +81,52 @@ fn get_from_api(domain: CertLoader) -> String {
         panic!("Failed to parse json; error is {}", e);
     });
 
-    let sha256_value = json.as_object()
-        .and_then(|object| object.get("certificate"))
-        .and_then(|cert| cert.as_object())
-        .and_then(|hashes| hashes.get("hashes"))
-        .and_then(|sha| sha.get("sha256"))
-        .and_then(|s256| s256.as_str())
-        .unwrap_or_else(|| {
-            panic!("Failed to get '.certificate.hashes.sha256' value from json");
-        });
-    return sha256_value.to_string();
+    let cert_chain = json.as_object()
+        .and_then(|object| object.get("chain"))
+        .and_then(|cert| cert.as_array());
+
+    let mut vec = Vec::new();
+    for number in 0..cert_chain.unwrap().len() {
+        let s = cert_chain
+            .and_then(|hashes| hashes.get(number))
+            .and_then(|sha| sha.get("der"))
+            .and_then(|sha| sha.get("hashes"))
+            .and_then(|sha| sha.get("sha256"))
+            .and_then(|s256| s256.as_str())
+            .unwrap_or_else(|| {
+                panic!("Failed to get '.certificate.hashes.sha256' value from json");
+            });
+        vec.push(s.to_string());
+    }
+    return vec;
 }
 
-fn pin_cert_to_domain(certificate_loader: CertLoader) {
-    let string = load_remote_certificate(certificate_loader.clone());
-    let hash_from_api = get_from_api(certificate_loader.clone());
-    let do_the_match = if string == hash_from_api { "yes" } else { "nope" };
-    println!("Did the domain {}'s certificate, as seen locally, match what the API reports? {}",
-             certificate_loader.domain, do_the_match);
+fn vec_compare(first: Vec<String>, second: Vec<String>) -> bool {
+    if first.len() != second.len() {
+        return false;
+    }
+    for n in 0..first.len() {
+        if !second.contains(first.get(n).unwrap()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn pin_certificates_for_domain(certificate_loader: CertLoader) {
+    let hash_from_local = load_certificate_hashes_via_local(certificate_loader.clone());
+    let hash_from_api = load_certificate_hashes_via_api(certificate_loader.clone());
+
+    // verify the entire chain equals and exactly the same
+    let are_equal = vec_compare(hash_from_local, hash_from_api);
+    println!("Did the domain {}'s certificates, as seen locally, match what the API reports? {}",
+             certificate_loader.domain, are_equal);
 }
 
 fn main() {
-    pin_cert_to_domain(CertLoader { domain: "asciirange.com" });
-    pin_cert_to_domain(CertLoader { domain: "tilltrump.com" });
-    pin_cert_to_domain(CertLoader { domain: "cert.ist" });
-    pin_cert_to_domain(CertLoader { domain: "urip.io" });
+    pin_certificates_for_domain(CertLoader { domain: "asciirange.com" });
+    pin_certificates_for_domain(CertLoader { domain: "tilltrump.com" });
+    pin_certificates_for_domain(CertLoader { domain: "cert.ist" });
+    pin_certificates_for_domain(CertLoader { domain: "urip.io" });
     std::process::exit(0);
 }
